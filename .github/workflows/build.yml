@@ -1,35 +1,25 @@
+# ============================================================
+# VMP Build & Release
+# 触发: push tag v* 或手动 workflow_dispatch
+# 产物: CLI (win/linux) + GUI (win/linux) + NSIS installer
+# ============================================================
 name: Build & Release
 
 on:
   push:
-    branches: [master, main]
     tags: ['v*']
   workflow_dispatch:
     inputs:
-      publish:
-        description: '是否创建 GitHub Release'
-        required: true
-        default: true
-        type: boolean
-      tag_name:
-        description: 'Release 标签名，留空则自动生成 dev-<run_number>'
+      release_tag:
+        description: '手动发布使用的 Release tag，例如 v1.0.0；留空则使用当前分支/标签名'
         required: false
-        default: ''
         type: string
-      prerelease:
-        description: '是否标记为预发布版本'
-        required: true
-        default: true
-        type: boolean
 
 permissions:
   contents: write
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
+  # ── 1. 编译 ARM64 VM 解释器 blob ──────────────────────────
   stub:
     name: VM Stub (linux/arm64)
     runs-on: ubuntu-latest
@@ -82,12 +72,12 @@ jobs:
           print(f'    vm_entry=0x{off1:X}  vm_entry_token=0x{off2:X}  _token_table_va=0x{off3:X}')
           PYEOF
 
-      - name: Upload VM blob
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: vm-interp-blob
           path: build/vm_interp.bin
 
+  # ── 2. CLI: Go 交叉编译 (win + linux) ─────────────────────
   cli:
     name: CLI (${{ matrix.goos }})
     needs: stub
@@ -123,19 +113,16 @@ jobs:
             -o vmpacker-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
             ./cmd/vmpacker/
 
-      - name: Upload CLI
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.goos }}
           path: vmpacker-*
 
+  # ── 3. GUI Windows (Wails + NSIS) ─────────────────────────
   gui-windows:
     name: GUI (Windows)
     needs: stub
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
     steps:
       - uses: actions/checkout@v4
 
@@ -159,12 +146,12 @@ jobs:
         working-directory: vmp-gui
         run: wails build -nsis
 
-      - name: Upload Windows GUI
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: gui-windows
           path: vmp-gui/build/bin/*.exe
 
+  # ── 4. GUI Linux (Wails) ──────────────────────────────────
   gui-linux:
     name: GUI (Linux)
     needs: stub
@@ -199,66 +186,43 @@ jobs:
         working-directory: vmp-gui
         run: wails build
 
-      - name: Upload Linux GUI
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: gui-linux
           path: vmp-gui/build/bin/vmp-gui
 
+  # ── 5. 发布 (tag 或手动触发) ──────────────────────────────
   release:
-    name: Auto Release
-    needs: [stub, cli, gui-windows, gui-linux]
-    if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    name: Release
+    needs: [cli, gui-windows, gui-linux]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          pattern: '*'
+          pattern: '{cli,gui}-*'
           path: dist/
           merge-multiple: true
 
-      - name: Normalize release assets
+      - name: Set release tag
+        id: release_tag
+        shell: bash
         run: |
-          mkdir -p release
-          find dist -maxdepth 3 -type f | sort
-          cp dist/vm_interp.bin release/vm_interp.bin
-          cp dist/vmpacker-linux-amd64 release/vmpacker-linux-amd64
-          cp dist/vmpacker-windows-amd64.exe release/vmpacker-windows-amd64.exe
-          if [ -f dist/vmp-gui ]; then cp dist/vmp-gui release/vmp-gui-linux-amd64; fi
-          find dist -type f -name '*.exe' ! -name 'vmpacker-windows-amd64.exe' -exec cp {} release/ \;
-          cd release
-          sha256sum * > SHA256SUMS.txt
-          ls -lh
-
-      - name: Resolve release metadata
-        id: meta
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            tag="${GITHUB_REF_NAME}"
-            prerelease="false"
-            name="VMPacker ${GITHUB_REF_NAME}"
-          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${{ inputs.tag_name }}" ]]; then
-            tag="${{ inputs.tag_name }}"
-            prerelease="${{ inputs.prerelease }}"
-            name="VMPacker ${tag}"
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            tag="dev-${GITHUB_RUN_NUMBER}"
-            prerelease="true"
-            name="VMPacker ${tag}"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
 
-      - name: Create or update GitHub Release
+      - name: List release assets
+        run: find dist/ -type f | sort
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.name }}
-          prerelease: ${{ steps.meta.outputs.prerelease }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: ${{ steps.release_tag.outputs.tag }}
           generate_release_notes: true
-          files: release/*
+          files: dist/*
