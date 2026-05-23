@@ -349,24 +349,30 @@ func (p *Packer) Process() error {
 	type funcEntry struct {
 		name   string
 		finder func() (*vm.FuncInfo, error)
+		auto   bool
 	}
 	var entries []funcEntry
 	if p.autoDiscover {
 		autoSpecs := p.AutoDiscoverFunctions(f)
 		fmt.Printf("[*] Auto discovered %d entry function(s)\n", len(autoSpecs))
-		p.addrSpecs = append(p.addrSpecs, autoSpecs...)
+		for _, spec := range autoSpecs {
+			s := spec
+			entries = append(entries, funcEntry{s.Name, func() (*vm.FuncInfo, error) {
+				return p.FindFunctionByAddr(f, s)
+			}, true})
+		}
 	}
 	for _, funcName := range p.funcNames {
 		fn := funcName
 		entries = append(entries, funcEntry{fn, func() (*vm.FuncInfo, error) {
 			return p.FindFunction(f, fn)
-		}})
+		}, false})
 	}
 	for _, spec := range p.addrSpecs {
 		s := spec
 		entries = append(entries, funcEntry{s.Name, func() (*vm.FuncInfo, error) {
 			return p.FindFunctionByAddr(f, s)
-		}})
+		}, false})
 	}
 
 	var funcs []FuncBytecode
@@ -403,6 +409,10 @@ func (p *Packer) Process() error {
 		}
 		result, err := trans.Translate(insts)
 		if err != nil {
+			if entry.auto {
+				fmt.Printf("    [!] Auto skip: translation failed: %v\n", err)
+				continue
+			}
 			return fmt.Errorf("translation failed: %v", err)
 		}
 
@@ -459,6 +469,11 @@ func (p *Packer) Process() error {
 
 				df.Close()
 				fmt.Printf("    [+] 翻译失败 debug 文件: %s\n", debugPath)
+			}
+
+			if entry.auto {
+				fmt.Printf("    [!] Auto skip: %s has %d unsupported instruction(s)\n", entry.name, len(result.Unsupported))
+				continue
 			}
 
 			return fmt.Errorf("translation aborted: %d unsupported instruction(s) in %s — cannot produce safe output",
@@ -558,6 +573,10 @@ func (p *Packer) Process() error {
 		}
 
 		funcs = append(funcs, FuncBytecode{FI: fi, Encrypted: encrypted, XorKey: xorKey})
+	}
+
+	if len(funcs) == 0 {
+		return fmt.Errorf("no functions can be protected after filtering unsupported auto-discovered entries")
 	}
 
 	// 第二阶段: 批量注入 (一次 PT_NOTE 劫持)
