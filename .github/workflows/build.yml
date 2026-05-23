@@ -1,11 +1,3 @@
-# ============================================================
-# VMP Build & Auto Release
-# 触发:
-#   1. push 到 master/main 后自动构建并发布 prerelease
-#   2. push tag v* 后自动构建并发布正式 release
-#   3. 手动 workflow_dispatch 可选择是否发布
-# 产物: CLI (win/linux) + GUI (win/linux) + VM blob
-# ============================================================
 name: Build & Release
 
 on:
@@ -232,7 +224,7 @@ jobs:
       - name: Normalize release assets
         run: |
           mkdir -p release
-          find dist -type f -maxdepth 3 | sort
+          find dist -maxdepth 3 -type f | sort
           cp dist/vm_interp.bin release/vm_interp.bin
           cp dist/vmpacker-linux-amd64 release/vmpacker-linux-amd64
           cp dist/vmpacker-windows-amd64.exe release/vmpacker-windows-amd64.exe
