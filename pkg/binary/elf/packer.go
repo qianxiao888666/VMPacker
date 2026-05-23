@@ -85,6 +85,7 @@ type Packer struct {
 	stripSymbols bool
 	debug        bool
 	tokenEntry   bool // Token 化入口模式
+	autoDiscover bool
 	data         []byte
 	interpBlob   []byte
 }
@@ -98,6 +99,10 @@ type FuncBytecode struct {
 
 // NewPacker 创建 ELF 打包器
 func NewPacker(input, output string, funcs []string, addrSpecs []AddrSpec, verbose, strip, debug, tokenEntry bool, interpBlob []byte) *Packer {
+	return NewPackerWithAuto(input, output, funcs, addrSpecs, verbose, strip, debug, tokenEntry, false, interpBlob)
+}
+
+func NewPackerWithAuto(input, output string, funcs []string, addrSpecs []AddrSpec, verbose, strip, debug, tokenEntry, autoDiscover bool, interpBlob []byte) *Packer {
 	return &Packer{
 		inputPath:    input,
 		outputPath:   output,
@@ -107,6 +112,7 @@ func NewPacker(input, output string, funcs []string, addrSpecs []AddrSpec, verbo
 		stripSymbols: strip,
 		debug:        debug,
 		tokenEntry:   tokenEntry,
+		autoDiscover: autoDiscover,
 		interpBlob:   interpBlob,
 	}
 }
@@ -135,53 +141,38 @@ func (p *Packer) FindFunction(f *elf.File, name string) (*vm.FuncInfo, error) {
 	return nil, fmt.Errorf("function '%s' not found", name)
 }
 
-// FindFunctionByAddr 通过地址查找函数
-func (p *Packer) FindFunctionByAddr(f *elf.File, spec AddrSpec) (*vm.FuncInfo, error) {
-	// 优先在 .text 段中定位
+func (p *Packer) findExecutableRange(f *elf.File, addr uint64) (string, uint64, uint64, uint64, []byte, error) {
 	textSec := f.Section(".text")
-
-	var secName string
-	var secAddr, secOffset, secSize uint64
-	var secData []byte
-
-	if textSec != nil {
-		secName = ".text"
-		secAddr = textSec.Addr
-		secOffset = textSec.Offset
-		secSize = textSec.Size
+	if textSec != nil && addr >= textSec.Addr && addr < textSec.Addr+textSec.Size {
 		d, err := textSec.Data()
 		if err != nil {
-			return nil, fmt.Errorf("reading .text failed: %v", err)
+			return "", 0, 0, 0, nil, fmt.Errorf("reading .text failed: %v", err)
 		}
-		secData = d
-	} else {
-		// Fallback: 在可执行 LOAD segment 中查找
-		found := false
-		for _, prog := range f.Progs {
-			if prog.Type != elf.PT_LOAD {
-				continue
-			}
-			if prog.Flags&elf.PF_X == 0 {
-				continue
-			}
-			segEnd := prog.Vaddr + prog.Memsz
-			if spec.Addr >= prog.Vaddr && spec.Addr < segEnd {
-				secName = "__LOAD_X"
-				secAddr = prog.Vaddr
-				secOffset = prog.Off
-				secSize = prog.Filesz
-				d := make([]byte, prog.Filesz)
-				if _, err := prog.ReadAt(d, 0); err != nil {
-					return nil, fmt.Errorf("reading LOAD segment failed: %v", err)
-				}
-				secData = d
-				found = true
-				break
-			}
+		return ".text", textSec.Addr, textSec.Offset, textSec.Size, d, nil
+	}
+
+	for _, prog := range f.Progs {
+		if prog.Type != elf.PT_LOAD || prog.Flags&elf.PF_X == 0 {
+			continue
 		}
-		if !found {
-			return nil, fmt.Errorf("address 0x%X not in any executable segment", spec.Addr)
+		segEnd := prog.Vaddr + prog.Filesz
+		if addr >= prog.Vaddr && addr < segEnd {
+			d := make([]byte, prog.Filesz)
+			if _, err := prog.ReadAt(d, 0); err != nil {
+				return "", 0, 0, 0, nil, fmt.Errorf("reading LOAD segment failed: %v", err)
+			}
+			return "__LOAD_X", prog.Vaddr, prog.Off, prog.Filesz, d, nil
 		}
+	}
+
+	return "", 0, 0, 0, nil, fmt.Errorf("address 0x%X not in any executable segment", addr)
+}
+
+// FindFunctionByAddr 通过地址查找函数
+func (p *Packer) FindFunctionByAddr(f *elf.File, spec AddrSpec) (*vm.FuncInfo, error) {
+	secName, secAddr, secOffset, secSize, secData, err := p.findExecutableRange(f, spec.Addr)
+	if err != nil {
+		return nil, err
 	}
 
 	// 确认地址在范围内
@@ -219,6 +210,59 @@ func (p *Packer) FindFunctionByAddr(f *elf.File, spec AddrSpec) (*vm.FuncInfo, e
 		Offset:  secOffset + (spec.Addr - secAddr),
 	}
 	return fi, nil
+}
+
+func (p *Packer) AutoDiscoverFunctions(f *elf.File) []AddrSpec {
+	seen := make(map[uint64]bool)
+	var specs []AddrSpec
+	add := func(addr uint64, name string) {
+		if addr == 0 || seen[addr] {
+			return
+		}
+		if _, _, _, _, _, err := p.findExecutableRange(f, addr); err != nil {
+			return
+		}
+		seen[addr] = true
+		specs = append(specs, AddrSpec{Addr: addr, Name: name})
+	}
+
+	add(f.Entry, "elf_entry")
+
+	for _, sectionName := range []string{".preinit_array", ".init_array", ".fini_array"} {
+		sec := f.Section(sectionName)
+		if sec == nil || sec.Size == 0 {
+			continue
+		}
+		data, err := sec.Data()
+		if err != nil {
+			continue
+		}
+		for off := 0; off+8 <= len(data); off += 8 {
+			addr := binary.LittleEndian.Uint64(data[off:])
+			add(addr, fmt.Sprintf("%s_%d", strings.TrimPrefix(sectionName, "."), off/8))
+		}
+	}
+
+	if syms, err := f.DynamicSymbols(); err == nil {
+		for _, sym := range syms {
+			if elf.ST_TYPE(sym.Info) != elf.STT_FUNC || sym.Value == 0 {
+				continue
+			}
+			if sym.Name == "JNI_OnLoad" || strings.HasPrefix(sym.Name, "Java_") {
+				if sym.Size > 0 && !seen[sym.Value] {
+					if _, _, _, _, _, err := p.findExecutableRange(f, sym.Value); err == nil {
+						seen[sym.Value] = true
+						specs = append(specs, AddrSpec{Addr: sym.Value, End: sym.Value + sym.Size, Name: sym.Name})
+					}
+				} else {
+					add(sym.Value, sym.Name)
+				}
+			}
+		}
+	}
+
+	sort.Slice(specs, func(i, j int) bool { return specs[i].Addr < specs[j].Addr })
+	return specs
 }
 
 // ExtractFuncCode 提取函数机器码
@@ -307,6 +351,11 @@ func (p *Packer) Process() error {
 		finder func() (*vm.FuncInfo, error)
 	}
 	var entries []funcEntry
+	if p.autoDiscover {
+		autoSpecs := p.AutoDiscoverFunctions(f)
+		fmt.Printf("[*] Auto discovered %d entry function(s)\n", len(autoSpecs))
+		p.addrSpecs = append(p.addrSpecs, autoSpecs...)
+	}
 	for _, funcName := range p.funcNames {
 		fn := funcName
 		entries = append(entries, funcEntry{fn, func() (*vm.FuncInfo, error) {
