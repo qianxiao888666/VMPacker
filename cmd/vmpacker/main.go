@@ -33,6 +33,7 @@ func main() {
 	strip := flag.Bool("strip", true, "清除符号表（防止strip破坏保护）")
 	debug := flag.Bool("debug", false, "生成 debug 对照文件（ARM64 → VM 字节码映射）")
 	tokenEntry := flag.Bool("token", true, "启用 Token 化入口模式（3 指令跳板）— 默认开启")
+	autoDiscover := flag.Bool("auto", false, "无符号表时自动提取 ELF Entry、init/fini array、JNI_OnLoad、Java_* 并按地址保护")
 	info := flag.Bool("info", false, "仅打印 ELF 信息，不做保护")
 
 	flag.Usage = func() {
@@ -40,7 +41,8 @@ func main() {
 
 用法:
   vmpacker -func <函数名> [-v] [-o output] <input.elf>
-  vmpacker -addr <地址:大小[:名称]> [-v] [-o output] <input.elf>
+  vmpacker -addr <地址[:名称]> [-v] [-o output] <input.elf>
+  vmpacker -auto [-v] [-o output] <input.elf>
   vmpacker -info <input.elf>
 
 选项:
@@ -53,6 +55,7 @@ func main() {
   vmpacker -func "check_license,verify_token" app.elf
   vmpacker -addr "0x4006AC-0x400790" app.elf
   vmpacker -addr "0x4006AC-0x400790:main" -func verify app.elf
+  vmpacker -auto app.elf
   vmpacker -info app.elf
 `)
 	}
@@ -82,8 +85,8 @@ func main() {
 	}
 
 	// 需要指定函数
-	if *funcList == "" && *addrList == "" {
-		fmt.Fprintf(os.Stderr, "[!] 请用 -func 或 -addr 指定要保护的函数\n")
+	if *funcList == "" && *addrList == "" && !*autoDiscover {
+		fmt.Fprintf(os.Stderr, "[!] 请用 -func、-addr 或 -auto 指定要保护的函数\n")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -129,9 +132,10 @@ func main() {
 	fmt.Printf("[*] 输入: %s\n", inputPath)
 	fmt.Printf("[*] 输出: %s\n", outPath)
 	fmt.Printf("[*] 保护函数: %v\n", funcs)
+	fmt.Printf("[*] 自动发现: %v\n", *autoDiscover)
 	fmt.Println()
 
-	packer := elfpacker.NewPacker(inputPath, outPath, funcs, addrSpecs, *verbose, *strip, *debug, *tokenEntry, interpBlob)
+	packer := elfpacker.NewPackerWithAuto(inputPath, outPath, funcs, addrSpecs, *verbose, *strip, *debug, *tokenEntry, *autoDiscover, interpBlob)
 	if err := packer.Process(); err != nil {
 		fmt.Fprintf(os.Stderr, "\n[!] 失败: %v\n", err)
 		os.Exit(1)
